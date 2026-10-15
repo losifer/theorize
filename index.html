@@ -1,23 +1,33 @@
----
-layout: default
----
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Theorize</title>
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+    }
 
-<div class="home">
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #2e3b4e;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    }
 
-  <h1 class="page-heading">The Posts</h1>
-
-  <ul class="post-list">
-    {% for post in site.posts %}
-      <li>
-        <span class="post-meta">{{ post.date | date: "%b %-d, %Y" }}</span>
-
-        <h2>
-          <a class="post-link" href="{{ post.url | prepend: site.baseurl }}">{{ post.title | escape }}</a>
-        </h2>
-      </li>
-    {% endfor %}
-  </ul>
-
-  <p class="rss-subscribe">subscribe <a href="{{ "/feed.xml" | prepend: site.baseurl }}">via RSS</a></p>
-
-</div>
+    h1 {
+      margin: 0;
+      font-size: clamp(2.5rem, 10vw, 7rem);
+      font-weight: 700;
+      letter-spacing: 0.15em;
+    }
+  </style>
+</head>
+<body>
+  <h1>THEORIZE</h1>
+</body>
+</html>
