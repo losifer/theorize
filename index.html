@@ -14,20 +14,382 @@
       display: flex;
       align-items: center;
       justify-content: center;
+      overflow: hidden;
       background: #2e3b4e;
       color: #fff;
       font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
     }
 
+    /* Plain-text fallback; also the source of the font, size and spacing the 3D letters copy. */
     h1 {
       margin: 0;
       font-size: clamp(2.5rem, 10vw, 7rem);
       font-weight: 700;
       letter-spacing: 0.15em;
     }
+
+    .is-3d h1 {
+      opacity: 0;
+    }
+
+    canvas {
+      position: fixed;
+      inset: 0;
+      display: block;
+      touch-action: none;
+    }
   </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+      }
+    }
+  </script>
 </head>
 <body>
   <h1>THEORIZE</h1>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { toCreasedNormals } from 'three/addons/utils/BufferGeometryUtils.js';
+
+    // All scene lengths are in em of the heading's font size.
+    const TRACE_SIZE = 320;      // px the glyphs are rasterised at before tracing
+    const DEPTH = 0.22;          // extrusion depth
+    const BEVEL = 0.012;
+    const WALL_GAP = 0.28;       // distance from the back of the letters to the shadow wall
+    const FOV = 35;
+    const REACH = 4;             // how far in front of the text the letters "look" at the pointer
+    const MAX_TILT = 0.6;        // radians
+    const LIFT = 0.45;           // how far the letter under the pointer rises
+    const LIFT_RADIUS = 0.9;
+
+    const heading = document.querySelector('h1');
+    const text = heading.textContent.trim();
+    const headingStyle = getComputedStyle(heading);
+    const letterSpacing = parseFloat(headingStyle.letterSpacing) / parseFloat(headingStyle.fontSize) || 0;
+    const traceFont = `${headingStyle.fontWeight} ${TRACE_SIZE}px ${headingStyle.fontFamily}`;
+
+    const traceCanvas = document.createElement('canvas');
+    const traceCtx = traceCanvas.getContext('2d', { willReadFrequently: true });
+
+    // Rasterise one glyph in the page font and trace its outline with marching squares,
+    // so the 3D letters use exactly the font the browser renders. Returns closed loops in em.
+    function traceGlyph(char) {
+      const ctx = traceCtx;
+      ctx.font = traceFont;
+      const m = ctx.measureText(char);
+      const pad = 4;
+      const ox = Math.ceil(m.actualBoundingBoxLeft) + pad;
+      const oy = Math.ceil(m.actualBoundingBoxAscent) + pad;
+      const w = ox + Math.ceil(m.actualBoundingBoxRight) + pad;
+      const h = oy + Math.ceil(m.actualBoundingBoxDescent) + pad;
+      if (w <= 2 * pad || h <= 2 * pad) return [];
+      traceCanvas.width = w;
+      traceCanvas.height = h;
+      ctx.font = traceFont;
+      ctx.fillStyle = '#fff';
+      ctx.fillText(char, ox, oy);
+      const data = ctx.getImageData(0, 0, w, h).data;
+      const at = (x, y) => data[(y * w + x) * 4 + 3];
+
+      const T = 128;
+      const links = new Map();
+      const hKey = (x, y) => (y * w + x) * 2;       // edge from sample (x, y) to (x + 1, y)
+      const vKey = (x, y) => (y * w + x) * 2 + 1;   // edge from sample (x, y) to (x, y + 1)
+      const link = (a, b) => {
+        if (!links.has(a)) links.set(a, []);
+        if (!links.has(b)) links.set(b, []);
+        links.get(a).push(b);
+        links.get(b).push(a);
+      };
+
+      for (let y = 0; y < h - 1; y++) {
+        for (let x = 0; x < w - 1; x++) {
+          const tl = at(x, y), tr = at(x + 1, y), br = at(x + 1, y + 1), bl = at(x, y + 1);
+          const c = (tl >= T ? 8 : 0) | (tr >= T ? 4 : 0) | (br >= T ? 2 : 0) | (bl >= T ? 1 : 0);
+          if (c === 0 || c === 15) continue;
+          const top = hKey(x, y), bottom = hKey(x, y + 1), left = vKey(x, y), right = vKey(x + 1, y);
+          switch (c) {
+            case 1: case 14: link(left, bottom); break;
+            case 2: case 13: link(bottom, right); break;
+            case 3: case 12: link(left, right); break;
+            case 4: case 11: link(top, right); break;
+            case 6: case 9: link(top, bottom); break;
+            case 7: case 8: link(top, left); break;
+            default: {
+              const centerInside = (tl + tr + br + bl) / 4 >= T;
+              if ((c === 5) === centerInside) { link(top, left); link(bottom, right); }
+              else { link(top, right); link(left, bottom); }
+            }
+          }
+        }
+      }
+
+      const edgePoint = (key) => {
+        const cell = key >> 1, x = cell % w, y = (cell - x) / w;
+        const a = at(x, y);
+        const b = key & 1 ? at(x, y + 1) : at(x + 1, y);
+        const t = (T - a) / (b - a);
+        const px = key & 1 ? x + 0.5 : x + 0.5 + t;
+        const py = key & 1 ? y + 0.5 + t : y + 0.5;
+        return [(px - ox) / TRACE_SIZE, (oy - py) / TRACE_SIZE];
+      };
+
+      const loops = [];
+      const seen = new Set();
+      for (const start of links.keys()) {
+        if (seen.has(start)) continue;
+        const loop = [];
+        let prev = -1, cur = start;
+        while (cur !== undefined && !seen.has(cur)) {
+          seen.add(cur);
+          loop.push(edgePoint(cur));
+          const [a, b] = links.get(cur);
+          const next = a === prev ? b : a;
+          prev = cur;
+          cur = next;
+        }
+        if (loop.length > 2) loops.push(loop);
+      }
+      return loops;
+    }
+
+    // Douglas-Peucker on an open polyline; keeps both ends.
+    function simplifyLine(pts, tol) {
+      const keep = new Uint8Array(pts.length);
+      keep[0] = keep[pts.length - 1] = 1;
+      const stack = [[0, pts.length - 1]];
+      while (stack.length) {
+        const [s, e] = stack.pop();
+        const [ax, ay] = pts[s], [bx, by] = pts[e];
+        const dx = bx - ax, dy = by - ay, len = Math.hypot(dx, dy) || 1;
+        let maxD = 0, idx = -1;
+        for (let i = s + 1; i < e; i++) {
+          const d = Math.abs((pts[i][0] - ax) * dy - (pts[i][1] - ay) * dx) / len;
+          if (d > maxD) { maxD = d; idx = i; }
+        }
+        if (maxD > tol) { keep[idx] = 1; stack.push([s, idx], [idx, e]); }
+      }
+      return pts.filter((_, i) => keep[i]);
+    }
+
+    function simplifyLoop(pts, tol) {
+      let far = 0, farD = 0;
+      for (let i = 1; i < pts.length; i++) {
+        const d = Math.hypot(pts[i][0] - pts[0][0], pts[i][1] - pts[0][1]);
+        if (d > farD) { farD = d; far = i; }
+      }
+      const a = simplifyLine(pts.slice(0, far + 1), tol);
+      const b = simplifyLine([...pts.slice(far), pts[0]], tol);
+      return [...a.slice(0, -1), ...b.slice(0, -1)];
+    }
+
+    function signedArea(pts) {
+      let area = 0;
+      for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+        area += pts[j][0] * pts[i][1] - pts[i][0] * pts[j][1];
+      }
+      return area / 2;
+    }
+
+    function contains(pts, [x, y]) {
+      let inside = false;
+      for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+        const [xi, yi] = pts[i], [xj, yj] = pts[j];
+        if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+      }
+      return inside;
+    }
+
+    // Outlines become shapes; loops nested inside an outline (the counters of O and R) become holes.
+    function glyphShapes(char) {
+      const loops = traceGlyph(char)
+        .map((pts) => simplifyLoop(pts, 0.2 / TRACE_SIZE))
+        .map((pts) => ({ pts, area: signedArea(pts) }))
+        .filter((loop) => loop.pts.length > 2 && Math.abs(loop.area) > 1e-5);
+
+      for (const loop of loops) {
+        const containers = loops
+          .filter((o) => o !== loop && Math.abs(o.area) > Math.abs(loop.area) && contains(o.pts, loop.pts[0]))
+          .sort((a, b) => Math.abs(a.area) - Math.abs(b.area));
+        loop.isHole = containers.length % 2 === 1;
+        loop.parent = containers[0];
+      }
+
+      const toVectors = (loop, counterClockwise) => {
+        const pts = (loop.area > 0) === counterClockwise ? loop.pts : [...loop.pts].reverse();
+        return pts.map(([x, y]) => new THREE.Vector2(x, y));
+      };
+
+      return loops.filter((loop) => !loop.isHole).map((outer) => {
+        const shape = new THREE.Shape(toVectors(outer, true));
+        for (const loop of loops) {
+          if (loop.isHole && loop.parent === outer) shape.holes.push(new THREE.Path(toVectors(loop, false)));
+        }
+        return shape;
+      });
+    }
+
+    function init() {
+      const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFShadowMap;
+
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(FOV, 1, 0.1, 500);
+
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x2e3b4e, 1.2));
+      const sun = new THREE.DirectionalLight(0xffffff, 2.9);
+      sun.position.set(-3.5, 5, 9);
+      sun.castShadow = true;
+      sun.shadow.mapSize.set(2048, 2048);
+      sun.shadow.radius = 5;
+      sun.shadow.bias = -0.0005;
+      sun.shadow.normalBias = 0.02;
+      Object.assign(sun.shadow.camera, { left: -6, right: 6, top: 3.5, bottom: -3.5, near: 1, far: 30 });
+      scene.add(sun);
+
+      // Invisible wall behind the letters: only the shadows show, over the page background.
+      const wall = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), new THREE.ShadowMaterial({ opacity: 0.38 }));
+      wall.position.z = -(DEPTH / 2 + BEVEL + WALL_GAP);
+      wall.receiveShadow = true;
+      scene.add(wall);
+
+      const material = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.55 });
+      const chars = [...text];
+      traceCtx.font = traceFont;
+      const penX = chars.map((_, i) => traceCtx.measureText(chars.slice(0, i).join('')).width / TRACE_SIZE + i * letterSpacing);
+
+      const letters = [];
+      const bounds = new THREE.Box3();
+      chars.forEach((char, i) => {
+        const shapes = glyphShapes(char);
+        if (!shapes.length) return;
+        const geometry = toCreasedNormals(new THREE.ExtrudeGeometry(shapes, {
+          depth: DEPTH,
+          bevelEnabled: true,
+          bevelThickness: BEVEL,
+          bevelSize: BEVEL,
+          bevelOffset: -BEVEL,   // keep the silhouette on the font outline instead of fattening it
+          bevelSegments: 2,
+        }), 0.3);
+        // Centre each glyph on its own origin so it pivots about its middle.
+        geometry.computeBoundingBox();
+        const center = geometry.boundingBox.getCenter(new THREE.Vector3());
+        geometry.translate(-center.x, -center.y, -center.z);
+
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        mesh.position.set(penX[i] + center.x, center.y, 0);
+        bounds.union(geometry.boundingBox.clone().translate(mesh.position));
+        scene.add(mesh);
+
+        const seed = Math.sin((i + 1) * 12.9898) * 43758.5453;
+        const stiffness = 60 + 55 * (seed - Math.floor(seed));
+        letters.push({
+          mesh,
+          stiffness,
+          damping: 2 * 0.4 * Math.sqrt(stiffness),
+          value: [0, 0, 0],      // tilt x, tilt y, lift
+          velocity: [0, 0, 0],
+        });
+      });
+
+      // Centre the whole word on the origin.
+      const offset = bounds.getCenter(new THREE.Vector3());
+      for (const letter of letters) {
+        letter.mesh.position.x -= offset.x;
+        letter.mesh.position.y -= offset.y;
+        letter.home = letter.mesh.position.clone();
+      }
+
+      const pointer = { x: 0, y: 0, active: false };
+      let pxPerEm = 1;
+      let dirty = true;
+
+      function resize() {
+        const w = window.innerWidth, h = window.innerHeight;
+        pxPerEm = parseFloat(getComputedStyle(heading).fontSize);
+        renderer.setSize(w, h);
+        camera.aspect = w / h;
+        // One em at the text plane covers exactly one CSS em on screen.
+        camera.position.z = h / pxPerEm / 2 / Math.tan(THREE.MathUtils.degToRad(FOV / 2));
+        camera.updateProjectionMatrix();
+        dirty = true;
+      }
+
+      function onPointerMove(event) {
+        pointer.x = (event.clientX - window.innerWidth / 2) / pxPerEm;
+        pointer.y = -(event.clientY - window.innerHeight / 2) / pxPerEm;
+        pointer.active = true;
+      }
+
+      function onPointerGone(event) {
+        if (event.type === 'pointerup' && event.pointerType === 'mouse') return;
+        pointer.active = false;
+      }
+
+      window.addEventListener('resize', resize);
+      window.addEventListener('pointermove', onPointerMove);
+      window.addEventListener('pointerdown', onPointerMove);
+      window.addEventListener('pointerup', onPointerGone);
+      window.addEventListener('pointercancel', onPointerGone);
+      window.addEventListener('blur', onPointerGone);
+      document.documentElement.addEventListener('pointerleave', onPointerGone);
+
+      const clamp = THREE.MathUtils.clamp;
+      const target = [0, 0, 0];
+      let last = performance.now();
+
+      function frame(now) {
+        const dt = Math.min((now - last) / 1000, 1 / 30);
+        last = now;
+        let moving = dirty;
+
+        for (const letter of letters) {
+          target[0] = target[1] = target[2] = 0;
+          if (pointer.active) {
+            const dx = pointer.x - letter.home.x, dy = pointer.y - letter.home.y;
+            target[0] = clamp(-Math.atan2(dy, REACH), -MAX_TILT, MAX_TILT);
+            target[1] = clamp(Math.atan2(dx, REACH), -MAX_TILT, MAX_TILT);
+            target[2] = LIFT * Math.exp(-(dx * dx + dy * dy) / (2 * LIFT_RADIUS * LIFT_RADIUS));
+          }
+          for (let k = 0; k < 3; k++) {
+            const delta = target[k] - letter.value[k];
+            letter.velocity[k] += (letter.stiffness * delta - letter.damping * letter.velocity[k]) * dt;
+            letter.value[k] += letter.velocity[k] * dt;
+            if (Math.abs(delta) > 1e-4 || Math.abs(letter.velocity[k]) > 1e-4) moving = true;
+          }
+          letter.mesh.rotation.x = letter.value[0];
+          letter.mesh.rotation.y = letter.value[1];
+          letter.mesh.position.z = letter.home.z + letter.value[2];
+        }
+
+        if (moving) {
+          renderer.render(scene, camera);
+          dirty = false;
+        }
+        requestAnimationFrame(frame);
+      }
+
+      resize();
+      renderer.render(scene, camera);
+      document.body.append(renderer.domElement);
+      document.documentElement.classList.add('is-3d');
+      requestAnimationFrame(frame);
+    }
+
+    try {
+      init();
+    } catch (error) {
+      // Leave the plain heading in place if WebGL is unavailable.
+      console.warn('3D lettering unavailable:', error);
+    }
+  </script>
 </body>
 </html>
